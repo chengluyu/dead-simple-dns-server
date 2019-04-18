@@ -1,5 +1,5 @@
 use std::io::{Error, ErrorKind, Read, Result};
-use std::net::{Ipv4Addr};
+use std::net::{Ipv4Addr, UdpSocket};
 use std::fs::{File};
 
 pub struct BytePacketBuffer {
@@ -110,6 +110,55 @@ impl BytePacketBuffer {
 
         Ok(())
     }
+
+    fn write(&mut self, val: u8) -> Result<()> {
+        if self.pos >= 512 {
+            Err(Error::new(ErrorKind::InvalidData, "end of buffer"))
+        } else {
+            self.buf[self.pos] = val;
+            self.pos += 1;
+            Ok(())
+        }
+    }
+
+    fn write_u8(&mut self, val: u8) -> Result<()> {
+        self.write(val)
+    }
+
+    fn write_u16(&mut self, val: u16) -> Result<()> {
+        self.write((val >> 8) as u8)?;
+        self.write((val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_u32(&mut self, val: u32) -> Result<()> {
+        self.write(((val >> 24) & 0xFF) as u8)?;
+        self.write(((val >> 16) & 0xFF) as u8)?;
+        self.write(((val >> 8) & 0xFF) as u8)?;
+        self.write((val & 0xFF) as u8)?;
+
+        Ok(())
+    }
+
+    fn write_qname(&mut self, qname: &str) -> Result<()> {
+        let split_str = qname.split('.').collect::<Vec<&str>>();
+
+        for label in split_str {
+            let len = label.len();
+            if len > 63 {
+                return Err(Error::new(ErrorKind::InvalidInput, "single label exceeds 63 characters of length"));
+            }
+
+            self.write_u8(len as u8)?;
+            for b in label.as_bytes() {
+                self.write_u8(*b)?;
+            }
+        }
+        self.write_u8(0)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -206,6 +255,30 @@ impl DnsHeader {
 
         Ok(())
     }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_u16(self.id)?;
+        buffer.write_u8(
+            (self.recursion_desired as u8) |
+                ((self.truncated_message as u8) << 1) |
+                ((self.authoritative_answer as u8) << 2) |
+                (self.opcode << 3) |
+                (((self.response as u8) << 7) as u8)
+        )?;
+        buffer.write_u8(
+            (self.rescode.clone() as u8) |
+                ((self.checking_disabled as u8) << 4) |
+                ((self.authed_data as u8) << 5) |
+                ((self.z as u8) << 6) |
+                ((self.recursion_available as u8) << 7)
+        )?;
+        buffer.write_u16(self.questions)?;
+        buffer.write_u16(self.answers)?;
+        buffer.write_u16(self.authoritative_entries)?;
+        buffer.write_u16(self.resource_entries)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Hash, Copy)]
@@ -248,6 +321,16 @@ impl DnsQuestion {
         buffer.read_qname(&mut self.name)?;
         self.qtype = QueryType::from_num(buffer.read_u16()?);
         let _ = buffer.read_u16()?;
+
+        Ok(())
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        buffer.write_qname(&self.name)?;
+
+        let typenum = self.qtype.to_num();
+        buffer.write_u16(typenum);
+        buffer.write_u16(1);
 
         Ok(())
     }
@@ -307,6 +390,31 @@ impl DnsRecord {
             }
         }
     }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
+        let start_pos = buffer.pos();
+
+        match *self {
+            DnsRecord::A { ref domain, ref addr, ttl } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::A.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(4)?;
+
+                let octets = addr.octets();
+                buffer.write_u8(octets[0])?;
+                buffer.write_u8(octets[1])?;
+                buffer.write_u8(octets[2])?;
+                buffer.write_u8(octets[3])?;
+            },
+            DnsRecord::UNKNOWN { .. } => {
+                println!("Skipped record: {:?}", self);
+            }
+        }
+
+        Ok(buffer.pos() - start_pos)
+    }
 }
 
 pub struct DnsPacket {
@@ -358,24 +466,75 @@ impl DnsPacket {
 
         Ok(result)
     }
+
+    pub fn write(&mut self, buffer: &mut BytePacketBuffer) -> Result<()> {
+        self.header.questions = self.questions.len() as u16;
+        self.header.answers = self.answers.len() as u16;
+        self.header.authoritative_entries = self.authorities.len() as u16;
+        self.header.resource_entries = self.resources.len() as u16;
+
+        self.header.write(buffer)?;
+
+        for question in &self.questions {
+            question.write(buffer)?;
+        }
+
+        for rec in &self.answers {
+            rec.write(buffer)?;
+        }
+
+        for rec in &self.authorities {
+            rec.write(buffer)?;
+        }
+
+        for rec in &self.resources {
+            rec.write(buffer)?;
+        }
+
+        Ok(())
+    }
 }
 
-//fn server_main() {
-//    let qname = "www.google.com";
-//    let qtype = QueryType::A;
-//
-//    let server = ("8.8.8.8", 53);
-//    let socket = UdpSocket::bind(("0.0.0.0", 43210)).unwrap();
-//
-//    let mut packet = DnsPacket::new();
-//
-//    packet.header.id = 6666;
-//    packet.header.questions = 1;
-//    packet.recursion_desired = true;
-//
-//}
-
 fn main() {
+    let qname = "www.google.com";
+    let qtype = QueryType::A;
+
+    let server = ("8.8.8.8", 53);
+    let socket = UdpSocket::bind(("0.0.0.0", 43210)).unwrap();
+
+    let mut packet = DnsPacket::new();
+
+    packet.header.id = 6666;
+    packet.header.questions = 1;
+    packet.header.recursion_desired = true;
+    packet.questions.push(DnsQuestion::new(qname.to_string(), qtype));
+
+    let mut req_buffer = BytePacketBuffer::new();
+    packet.write(&mut req_buffer).unwrap();
+
+    socket.send_to(&req_buffer.buf[0..req_buffer.pos], server);
+
+    let mut res_buffer = BytePacketBuffer::new();
+    socket.recv_from(&mut res_buffer.buf).unwrap();
+
+    let res_packet = DnsPacket::from_buffer(&mut res_buffer).unwrap();
+    println!("{:?}", res_packet.header);
+
+    for q in res_packet.questions {
+        println!("{:?}", q);
+    }
+    for rec in res_packet.answers {
+        println!("{:?}", rec);
+    }
+    for rec in res_packet.authorities {
+        println!("{:?}", rec);
+    }
+    for rec in res_packet.resources {
+        println!("{:?}", rec);
+    }
+}
+
+fn old_main() {
     let mut f = File::open("response_packet.txt").unwrap();
     let mut buffer = BytePacketBuffer::new();
     f.read(&mut buffer.buf).unwrap();
