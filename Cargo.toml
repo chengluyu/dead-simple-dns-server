@@ -1,0 +1,6 @@
+[package]
+name = "dead-simple-dns-server"
+version = "0.1.0"
+authors = ["chengluyu <chengluyu@live.cn>"]
+
+[dependencies]
