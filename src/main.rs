@@ -1,6 +1,9 @@
+extern crate rand;
+
 use std::io::{Error, ErrorKind, Read, Result};
 use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::fs::{File};
+use rand::{random};
 
 pub struct BytePacketBuffer {
     pub buf: [u8; 512],
@@ -566,6 +569,7 @@ impl DnsRecord {
     }
 }
 
+#[derive(Clone)]
 pub struct DnsPacket {
     pub header: DnsHeader,
     pub questions: Vec<DnsQuestion>,
@@ -642,7 +646,114 @@ impl DnsPacket {
 
         Ok(())
     }
+
+    pub fn get_random_a(&self) -> Option<String> {
+        if !self.answers.is_empty() {
+            let idx = random::<usize>() % self.answers.len();
+            let a_record = &self.answers[idx];
+            if let DnsRecord::A { ref addr, .. } = *a_record {
+                return Some(addr.to_string());
+            }
+        }
+
+        None
+    }
+
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<String> {
+        let mut new_authorities = Vec::new();
+        for auth in &self.authorities {
+            if let DnsRecord::NS { ref domain, ref host, .. } = *auth {
+                if !qname.ends_with(domain) {
+                    continue;
+                }
+
+                for rsrc in &self.resources {
+                    if let DnsRecord::A { ref domain, ref addr, ttl } = *rsrc {
+                        if domain != host {
+                            continue;
+                        }
+
+                        let rec = DnsRecord::A {
+                            domain: host.clone(),
+                            addr: *addr,
+                            ttl,
+                        };
+
+                        new_authorities.push(rec);
+                    }
+                }
+            }
+        }
+
+        if !new_authorities.is_empty() {
+            if let DnsRecord::A { addr, .. } = new_authorities[0] {
+                return Some(addr.to_string());
+            }
+        }
+
+        None
+    }
+
+    pub fn get_unresolved_ns(&self, qname: &str) -> Option<String> {
+        let mut new_authorities = Vec::new();
+        for auth in &self.authorities {
+            if let DnsRecord::NS { ref domain, ref host, .. } = *auth {
+                if !qname.ends_with(domain) {
+                    continue;
+                }
+
+                new_authorities.push(host);
+            }
+        }
+
+        if !new_authorities.is_empty() {
+            let idx = random::<usize>() % new_authorities.len();
+            return Some(new_authorities[idx].clone());
+        }
+
+        None
+    }
 }
+
+fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
+    let mut ns = "198.41.0.4".to_string();
+
+    loop {
+        println!("Attempting lookup of {:?} {} with {}", qtype, qname, ns);
+
+        let ns_copy = ns.clone();
+
+        let server = (ns_copy.as_str(), 53);
+        let response = lookup(qname, qtype.clone(), server)?;
+
+        if !response.answers.is_empty() && response.header.rescode == ResultCode::NOERROR {
+            return Ok(response.clone());
+        }
+
+        if response.header.rescode == ResultCode::NXDOMAIN {
+            return Ok(response.clone());
+        }
+
+        if let Some(new_ns) = response.get_resolved_ns(qname) {
+            ns = new_ns.clone();
+
+            continue;
+        }
+
+        let new_ns_name = match response.get_unresolved_ns(qname) {
+            Some(x) => x,
+            None => return Ok(response.clone())
+        };
+
+        let recursive_response = recursive_lookup(&new_ns_name, QueryType::A)?;
+
+        if let Some(new_ns) = recursive_response.get_random_a() {
+            ns = new_ns.clone();
+        } else {
+            return Ok(response.clone())
+        }
+    }
+} // end of fn
 
 fn lookup(qname: &str, qtype: QueryType, server: (&str, u16)) -> Result<DnsPacket> {
     let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
@@ -665,8 +776,6 @@ fn lookup(qname: &str, qtype: QueryType, server: (&str, u16)) -> Result<DnsPacke
 }
 
 fn main() {
-    let server = ("8.8.8.8", 53);
-
     let socket = UdpSocket::bind(("0.0.0.0", 2053)).unwrap();
 
     loop {
@@ -700,7 +809,7 @@ fn main() {
             let question = &request.questions[0];
             println!("Received query: {:?}", question);
 
-            if let Ok(result) = lookup(&question.name, question.qtype, server) {
+            if let Ok(result) = recursive_lookup(&question.name, question.qtype) {
                 packet.questions.push(question.clone());
                 packet.header.rescode = result.header.rescode;
 
