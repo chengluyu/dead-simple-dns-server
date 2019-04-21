@@ -181,7 +181,7 @@ impl BytePacketBuffer {
 pub enum ResultCode {
     NOERROR = 0,
     FORMERR = 1,
-    ServerFailure = 2,
+    SERVFAIL = 2,
     NXDOMAIN = 3,
     NOTIMP = 4,
     REFUSED = 5,
@@ -191,7 +191,7 @@ impl ResultCode {
     pub fn from_num(num: u8) -> ResultCode {
         match num {
             1 => ResultCode::FORMERR,
-            2 => ResultCode::ServerFailure,
+            2 => ResultCode::SERVFAIL,
             3 => ResultCode::NXDOMAIN,
             4 => ResultCode::NOTIMP,
             5 => ResultCode::REFUSED,
@@ -826,7 +826,7 @@ fn main() {
                     packet.answers.push(rec);
                 }
             } else {
-                packet.header.rescode = ResultCode::ServerFailure;
+                packet.header.rescode = ResultCode::SERVFAIL;
             }
 
             let mut res_buffer = BytePacketBuffer::new();
